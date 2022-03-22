@@ -1,7 +1,41 @@
-from typing import Callable, Dict, NamedTuple, OrderedDict
+from typing import Callable, Dict, Mapping, NamedTuple, OrderedDict
 from asyncpg import create_pool
 
-class Dao:
+class SqlOutput(Mapping):
+  def __init__(self, cls_type):
+    self._cls_type = cls_type
+    self._transform = []
+
+  def __iter__(self):
+    return iter(self.dict)
+
+  def __getitem__(self, item):
+    return self.dict[item]
+
+  def __len__(self):
+    return len(self.dict)
+
+  def value(self):
+    for field, func, new_field in self._transform:
+      t = func(self.dict[field])
+      if new_field == None:
+        self.dict[field] = t
+      else:
+        self.dict[new_field] = t
+        del self.dict[field]
+
+    return self._cls_type(**self.dict)
+
+
+  def map(self, field: str, func: Callable, new_field: str = None):
+    self._transform.append((field, func, new_field))
+    return self
+
+  def load(self, **kw_args):
+    self.dict = kw_args
+    return self
+
+class Dao():
   @classmethod
   def from_named_tuple(cls, nt: NamedTuple):
     return cls(**nt._asdict())
@@ -63,8 +97,6 @@ class Dao:
     return self._len
 
 class Database:
-  __dict: Dict[str, type] = {}
-  
   def __init__(self, dsn: str, command_timeout=60):
     self._pool = create_pool(dsn, command_timeout = command_timeout)
 
@@ -81,15 +113,18 @@ class Database:
       return func
     return self.__async_wrapper(func)
 
-  async def fetch(self, sql, cls: Callable, *args, **kw_args):
+  async def fetch(self, sql, so: SqlOutput, *args, **kw_args):
     await self._pool
     records = await self._pool.fetch(sql, *args, **kw_args)
-    return [cls(**r) for r in records]
+    return [so.load(**record).value() for record in records]
 
-  async def fetchrow(self, sql, cls: Callable, *args, **kw_args):
+  async def fetchrow(self, sql, so: SqlOutput, *args, **kw_args):
     await self._pool
     record = await self._pool.fetchrow(sql, *args, **kw_args)
-    return cls(**record) 
+    if record != None:
+      return so.load(**record).value()
+    else:
+      return None
 
   def __async_wrapper(self, func):
     async def decorator(*args, **kw_args):

@@ -6,7 +6,7 @@ import uuid, msgpack, sys
 from Cancel import Cancel
 from pool import AsyncIterator, merge, start_loop, poll
 
-from database import Database, Dao
+from database import Database, Dao, SqlOutput
 
 SagaDTO = namedtuple(
   'SagaDTO', 'id, name, instance_id, step, input, state, owner, delay, status'
@@ -40,9 +40,8 @@ class SagaDAL:
     return saga._replace(id = id)
 
   async def get_instance(self, name, instance_id):
-    ret =  await self._db.fetchrow('SELECT id, state FROM saga.instance WHERE name = $1 AND instance_id = $2 AND status = 0', dict, name, instance_id)
-    ret['state'] = msgpack.unpackb(ret['state'])
-    return ret
+    so = SqlOutput(dict).map('state', lambda s: msgpack.unpackb(s))
+    return await self._db.fetchrow('SELECT id, state FROM saga.instance WHERE name = $1 AND instance_id = $2 AND status = 0', so, name, instance_id)
     # TODO: empty
 
   async def get_state(self, name, instance_id):
@@ -64,6 +63,11 @@ class SagaDAL:
       raise SagaDAL.ConcurrencyException()
 
   async def get_pending_saga(self, name, owner, batch_size):
+    so = SqlOutput(SagaDTO) \
+      .map('input', lambda s: msgpack.unpackb(s)) \
+      .map('state', lambda s: msgpack.unpackb(s)) \
+      .map('start_after', (lambda s: 0), 'delay')
+
     ret = await self._db.fetch('''
 WITH cte AS (
   SELECT id FROM saga.instance
@@ -76,21 +80,14 @@ SET    status = 1, owner = $3
 FROM   cte
 WHERE  cte.id = i.id AND i.status = 0
 RETURNING i.*
-''', dict, name, batch_size, owner)
-    for i in ret:
-      i['input'] = msgpack.unpackb(i['input'])
-      i['state'] = msgpack.unpackb(i['state'])
-      i['delay'] = 0
-      del i['start_after']
+''', so, name, batch_size, owner)
     print('polling', ret)
-    return [SagaDTO(**saga) for saga in ret]
+    return ret
 
   async def keep_alive(self, owner, timeout):
     await self._db.execute('call saga.heart_beat($1, $2)', owner, timeout)
 
 class Saga:
-  _function_map = {}
-  _async_iter = AsyncIterator()
   _cancel = Cancel.from_signal()
 
   def __init__(self, name: str, batch_size, low_watermark, backoff, worker:int, health_check_timeout: int, dal: SagaDAL):
@@ -99,6 +96,9 @@ class Saga:
     self.worker = worker
     self.health_check_timeout = health_check_timeout
     self._dal = dal
+
+    self._function_map = {}
+    self._async_iter = AsyncIterator()
 
     def factory(func):
       async def new_func(saga):
@@ -225,7 +225,7 @@ class Test:
     #print(await dal.get_state(2))
     #print(await dal.new_saga(d))
     #print(await dal.get_pending_saga('deposit', saga.owner, 5))
-    await saga.start(uuid.uuid4().hex, step1, "my test", "initial state")
+    #await saga.start(uuid.uuid4().hex, step1, "my test", "initial state")
     await saga.start_event_loop()
 
 if __name__ == '__main__':
