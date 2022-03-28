@@ -10,10 +10,9 @@ from Cancel import Cancel
 T = TypeVar('T')
 
 class AsyncIterator():
-  __ll = deque()
-  __lock = Lock()
-
-  def __init__(self):  
+  def __init__(self):
+    self.__ll = deque()
+    self.__lock = Lock()
     self.__ll.append(Future())
 
     async def source(ll: deque):
