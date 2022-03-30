@@ -23,6 +23,7 @@ Minimalism applies to package dependencies too. This project has only one depend
 Think of a simple example of transferring fund from one account to another -
 ```python
 saga = Saga('transfer_fund', postgres_dsn_string)
+await saga._dal.init_db() # if you haven't done so
 
 @data_class
 class TransferInput:

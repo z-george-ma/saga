@@ -118,9 +118,9 @@ RETURNING i.*
 BEGIN;
 CREATE SCHEMA IF NOT EXISTS saga;
 COMMIT;
+
 BEGIN;
-DROP TABLE IF EXISTS saga.instance;
-CREATE TABLE saga.instance (
+CREATE TABLE IF NOT EXISTS saga.instance (
   id SERIAL PRIMARY KEY,
   name VARCHAR(100)  NOT NULL,
   instance_id VARCHAR(100) NOT NULL,
@@ -132,20 +132,18 @@ CREATE TABLE saga.instance (
   status INT NOT NULL, -- 0: pending, 1: in_progress, 2: complete, 3: error
   error TEXT
 );
-COMMIT;
-BEGIN;
-CREATE UNIQUE INDEX IX_instance_name_instance_id ON saga.instance(name, instance_id); -- ok
-CREATE INDEX IX_instance_runner_id_status ON saga.instance(runner_id, status);
-DROP TABLE IF EXISTS saga.runner;
-CREATE TABLE saga.runner (
+CREATE TABLE IF NOT EXISTS saga.runner (
   id SERIAL PRIMARY key,
   runner_id VARCHAR(100),
   last_seen TIMESTAMP WITHOUT TIME ZONE
 );
 COMMIT;
+
 BEGIN;
-CREATE INDEX IX_saga_runner_runner_id ON saga.runner(runner_id);
-CREATE INDEX IX_saga_runner_last_seen ON saga.runner(last_seen);
+CREATE UNIQUE INDEX IF NOT EXISTS IX_instance_name_instance_id ON saga.instance(name, instance_id); -- ok
+CREATE INDEX IF NOT EXISTS IX_instance_runner_id_status ON saga.instance(runner_id, status);
+CREATE INDEX IF NOT EXISTS IX_saga_runner_runner_id ON saga.runner(runner_id);
+CREATE INDEX IF NOT EXISTS IX_saga_runner_last_seen ON saga.runner(last_seen);
 CREATE OR REPLACE PROCEDURE saga.heart_beat(runner VARCHAR(100), timeout int)
 AS $$
   DECLARE 
@@ -160,8 +158,7 @@ AS $$
   END
 $$
 LANGUAGE plpgsql;
-COMMIT;
-BEGIN;
+
 CREATE OR REPLACE PROCEDURE saga.clean_up_dead_runner(timeout int)
 AS $$
   DECLARE 
