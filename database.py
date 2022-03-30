@@ -121,12 +121,9 @@ class Database:
         else:
             return None
 
-    def __async_wrapper(self, func):
-        async def decorator(*args, **kw_args):
-            await self._pool
-            return await func(*args, **kw_args)
-
-        return decorator
+    async def execute(self, sql, *args, **kw_args):
+        await self._pool
+        return await self._pool.execute(sql, *args, **kw_args)
 
     def close(self):
         return self._pool.close()

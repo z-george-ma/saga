@@ -26,14 +26,8 @@ class SagaReturn:
 
 
 class SagaError(Exception):
-    def __init__(self, message: str):
-        self.message = message
-
-
-@dataclass
-class SagaErrorState:
-    message: str
-    state: Any
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
 
 
 class Saga:
@@ -76,7 +70,7 @@ class Saga:
                     if isinstance(ret, SagaReturn):
                         saga = self._create_saga_dto(
                             saga.name,
-                            saga.owner,
+                            saga.runner_id,
                             saga.instance_id,
                             ret.step,
                             ret.input,
@@ -84,7 +78,7 @@ class Saga:
                             saga.id,
                             ret.delay,
                         )
-                        fields = "step, input, owner, delay, status"
+                        fields = "step, input, runner_id, delay, status"
                     else:
                         # if return value isn't a SagaReturn object, it is treated as end of saga, with return value as final state if not none
                         saga = saga._replace(state=ret, status=2)
@@ -101,10 +95,8 @@ class Saga:
                     # update failed - the saga is claimed by another process
                     pass
                 except SagaError as e:
-                    saga = saga._replace(
-                        state=SagaErrorState(e.message, saga.state), status=3
-                    )
-                    await self._dal.update_processing(saga, "status, state")
+                    saga = saga._replace(error=repr(e), status=3)
+                    await self._dal.update_processing(saga, "status, error")
                 except Exception as e:
                     try:
                         print(
@@ -148,7 +140,7 @@ class Saga:
         **kw_args,
     ):
         self.name = name
-        self.owner = uuid.uuid4().hex
+        self.runner_id = uuid.uuid4().hex
 
         # SagaDAL can be injected in for internal testing. Outside this module, caller will pass in dsn
         self._dal = kw_args.get("dal") or SagaDAL(Database(kw_args["dsn"]))
@@ -171,7 +163,7 @@ class Saga:
         So for web server that doesn't need worker pool, make sure *delay* is set to be None.
         """
         saga = self._create_saga_dto(
-            self.name, self.owner, instance_id, step, input, state, delay=delay
+            self.name, self.runner_id, instance_id, step, input, state, delay=delay
         )
         saga = await self._dal.new_saga(saga)
 
@@ -190,7 +182,7 @@ class Saga:
         ret = await self._dal.get_instance(self.name, instance_id)
         saga = self._create_saga_dto(
             self.name,
-            self.owner,
+            self.runner_id,
             instance_id,
             step,
             input,
@@ -198,7 +190,7 @@ class Saga:
             ret["id"],
             delay,
         )
-        await self._dal.update_pending(saga, "step, input, owner, delay, status")
+        await self._dal.update_pending(saga, "step, input, runner_id, delay, status")
 
         # if status of saga is in_progress (immediate start), send to task queue for consumption
         if saga.status == 1:
@@ -224,7 +216,7 @@ class Saga:
         async def get_pending_saga():
             try:
                 return await self._dal.get_pending_saga(
-                    self.name, self.owner, batch_size
+                    self.name, self.runner_id, batch_size
                 )
             except Exception as e:
                 return []
@@ -232,10 +224,10 @@ class Saga:
         async def execute_saga(saga: SagaDTO):
             if not saga.step in self._function_dict:
                 saga = saga._replace(
-                    state=SagaErrorState("Unrecognized saga step", None),
+                    error=repr(SagaError("Unrecognized saga step")),
                     status=3,
                 )
-                await self._dal.update_processing(saga, "state, status")
+                await self._dal.update_processing(saga, "error, status")
             else:
                 await self._function_dict[saga.step](saga)
 
@@ -243,7 +235,7 @@ class Saga:
         async def health_check(cancel):
             while not cancel():
                 try:
-                    await self._dal.keep_alive(self.owner, health_check_timeout)
+                    await self._dal.keep_alive(self.runner_id, health_check_timeout)
                 except:
                     pass
                 await sleep(1)
@@ -267,7 +259,15 @@ class Saga:
 
     @staticmethod
     def _create_saga_dto(
-        name, owner, instance_id: str, step, input, state, id=0, delay: float = None
+        name,
+        runner_id: str,
+        instance_id: str,
+        step,
+        input,
+        state,
+        id=0,
+        delay: float = None,
+        error: str = None,
     ):
         """Construct SagaDTO for consumption by SagaDAL"""
 
@@ -282,7 +282,9 @@ class Saga:
         if callable(step):
             step = step.__name__
 
-        return SagaDTO(id, name, instance_id, step, input, state, owner, delay, status)
+        return SagaDTO(
+            id, name, instance_id, step, input, state, runner_id, delay, status, error
+        )
 
 
 dal = SagaDAL(Database("postgresql://postgres:1234@localhost:5432/postgres"))
@@ -312,10 +314,8 @@ async def step3(input, state, set_state):
 
 class Test:
     async def main(self):
-        # print(await dal.get_state(2))
-        # print(await dal.new_saga(d))
-        # print(await dal.get_pending_saga('deposit', saga.owner, 5))
-        await saga.start(uuid.uuid4().hex, step1, "my test", "initial state", 0)
+        await saga._dal.init_db()
+        await saga.start(uuid.uuid4().hex, "step11", "my test", "initial state", 0)
         await saga.start_event_loop(100, 30, 0.5, 5, 10)
 
 
