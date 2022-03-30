@@ -1,0 +1,18 @@
+# Use this to run your local postgres database for testing
+# `docker-compose up`
+# `docker-compose stop`
+
+# You can use `docker-compose up -d` to leave your db running all the time, it will auto start when your computer next boots.
+
+version: "3"
+
+services:
+  postgres:
+    image: postgres:14-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=1234
+      - POSTGRES_DB=postgres
+    ports:
+      - 5432:5432

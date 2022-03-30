@@ -1,237 +1,328 @@
-from asyncio import all_tasks, create_task, gather, get_event_loop, sleep
-from collections import namedtuple
+from asyncio import (
+    CancelledError,
+    gather,
+    get_event_loop,
+    sleep,
+)
 from dataclasses import dataclass
-from typing import Any, Callable
-import uuid, msgpack, sys
-from Cancel import Cancel
-from pool import AsyncIterator, merge, start_loop, poll
+from typing import Any, Callable, Coroutine, TypeVar, Union
+import uuid, sys
+from dal import SagaDAL, SagaDTO
+from stream_utils import AsyncIterator, merge, start_loop, poll
 
-from database import Database, Dao, SqlOutput
+from database import Database
 
-SagaDTO = namedtuple(
-  'SagaDTO', 'id, name, instance_id, step, input, state, owner, delay, status'
-)
 
-@dataclass
-class SagaNext:
-  step: Callable
-  input: Any
-  state: Any = None
-  delay: float = None
+TInput = TypeVar("TInput")
+TState = TypeVar("TState")
+
 
 @dataclass
-class SagaThrow:
-  exception: Exception
+class SagaReturn:
+    step: str
+    input: TInput
+    state: Union[TState, None] = None
+    delay: float = None
+
+
+class SagaError(Exception):
+    def __init__(self, message: str):
+        self.message = message
+
 
 @dataclass
-class SagaEnd:
-  state: Any = None
+class SagaErrorState:
+    message: str
+    state: Any
 
-class SagaDAL:
-  class ConcurrencyException(Exception):
-    pass
-
-  def __init__(self, db: Database):
-    self._db = db
-
-  async def new_saga(self, saga: SagaDTO):
-    dao = Dao.from_named_tuple(saga._replace(input = msgpack.packb(saga.input), state = msgpack.packb(saga.state))).exclude('id, delay')
-    id = await self._db.fetchval(f'INSERT INTO saga.instance ({dao.fields()},start_after) VALUES({dao.placeholders()},now()::timestamp+interval \'1 seconds\'* ${dao.next}) RETURNING id', *dao.values(), saga.delay)
-    return saga._replace(id = id)
-
-  async def get_instance(self, name, instance_id):
-    so = SqlOutput(dict).map('state', lambda s: msgpack.unpackb(s))
-    return await self._db.fetchrow('SELECT id, state FROM saga.instance WHERE name = $1 AND instance_id = $2 AND status = 0', so, name, instance_id)
-    # TODO: empty
-
-  async def get_state(self, name, instance_id):
-    ret = await self._db.fetchval('SELECT state FROM saga.instance WHERE name = $1 AND instance_id = $2', name, instance_id)
-    return msgpack.unpackb(ret)
-
-  async def update_processing(self, saga: SagaDTO, fields: str):
-    dao = Dao.from_named_tuple(saga._replace(input = msgpack.packb(saga.input), state = msgpack.packb(saga.state)))
-    dao.include(fields).exclude('delay')
-    id = await self._db.fetchval(f'UPDATE saga.instance SET {dao.update()},start_after=now()::timestamp+interval \'1 seconds\'* ${dao.next} WHERE id = ${dao.next} AND status = 1 AND owner = ${dao.next} RETURNING id', *dao.values(), saga.delay, saga.id, saga.owner)
-    if id == None: 
-      raise SagaDAL.ConcurrencyException()
-
-  async def update_pending(self, saga: SagaDTO, fields: str):
-    dao = Dao.from_named_tuple(saga._replace(input = msgpack.packb(saga.input), state = msgpack.packb(saga.state)))
-    dao.include(fields).exclude('delay')
-    id = await self._db.fetchval(f'UPDATE saga.instance SET {dao.update()},start_after=now()::timestamp+interval \'1 seconds\'* ${dao.next} WHERE id = ${dao.next} AND status = 0 RETURNING id', *dao.values(), saga.delay, saga.id)
-    if id == None: 
-      raise SagaDAL.ConcurrencyException()
-
-  async def get_pending_saga(self, name, owner, batch_size):
-    so = SqlOutput(SagaDTO) \
-      .map('input', lambda s: msgpack.unpackb(s)) \
-      .map('state', lambda s: msgpack.unpackb(s)) \
-      .map('start_after', (lambda s: 0), 'delay')
-
-    ret = await self._db.fetch('''
-WITH cte AS (
-  SELECT id FROM saga.instance
-  WHERE name = $1 AND status = 0 AND start_after < now()::timestamp
-  ORDER BY start_after
-  LIMIT $2
-)
-UPDATE saga.instance i
-SET    status = 1, owner = $3
-FROM   cte
-WHERE  cte.id = i.id AND i.status = 0
-RETURNING i.*
-''', so, name, batch_size, owner)
-    print('polling', ret)
-    return ret
-
-  async def keep_alive(self, owner, timeout):
-    await self._db.execute('call saga.heart_beat($1, $2)', owner, timeout)
 
 class Saga:
-  _cancel = Cancel.from_signal()
+    def _set_state(dal: SagaDAL, saga: SagaDTO):
+        """Return a function to set internal state for a saga"""
 
-  def __init__(self, name: str, batch_size, low_watermark, backoff, worker:int, health_check_timeout: int, dal: SagaDAL):
-    self.name = name
-    self.owner = uuid.uuid4().hex
-    self.worker = worker
-    self.health_check_timeout = health_check_timeout
-    self._dal = dal
+        async def func(state):
+            new_saga = saga._replace(state=state)
+            await dal.update_processing(new_saga, "state")
 
-    self._function_map = {}
-    self._async_iter = AsyncIterator()
+        return func
 
-    def factory(func):
-      async def new_func(saga):
+    def _saga_step_decorator_generator(self):
+        def saga_step_decorator(
+            func: Callable[
+                [TInput, TState, Callable[[TState], Coroutine[Any, Any, None]]],
+                Union[SagaReturn, Any],
+            ]
+        ):
+            """Decorator for a saga function
+
+            See example for the format of a saga function
+
+            Saga function can either return another saga function for continuation, or any other value as final state to terminate the saga
+
+            Example:
+            >>> @saga.step
+            >>> my_func(input, state, set_state):
+            >>>    return another_saga_func(input, state, delay=10) # delay execution for 10 seconds
+
+            """
+
+            async def saga_wrapper(saga: SagaDTO):
+                try:
+                    # call saga function
+                    ret = await func(
+                        saga.input, saga.state, Saga._set_state(self._dal, saga)
+                    )
+
+                    if isinstance(ret, SagaReturn):
+                        saga = self._create_saga_dto(
+                            saga.name,
+                            saga.owner,
+                            saga.instance_id,
+                            ret.step,
+                            ret.input,
+                            ret.state,
+                            saga.id,
+                            ret.delay,
+                        )
+                        fields = "step, input, owner, delay, status"
+                    else:
+                        # if return value isn't a SagaReturn object, it is treated as end of saga, with return value as final state if not none
+                        saga = saga._replace(state=ret, status=2)
+                        fields = "status"
+
+                    if saga.state != None:
+                        fields += ", state"
+
+                    await self._dal.update_processing(saga, fields)
+
+                    if saga.status == 1:
+                        self._in_mem_sagas.send(saga)
+                except SagaDAL.ConcurrencyException:
+                    # update failed - the saga is claimed by another process
+                    pass
+                except SagaError as e:
+                    saga = saga._replace(
+                        state=SagaErrorState(e.message, saga.state), status=3
+                    )
+                    await self._dal.update_processing(saga, "status, state")
+                except Exception as e:
+                    try:
+                        print(
+                            "Error:",
+                            sys._getframe(1).f_code.co_name,
+                            sys._getframe(1).f_lineno,
+                            e,
+                        )
+                        # put back to the database for future pickup
+                        saga = saga._replace(status=0)
+                        await self._dal.update_processing(saga, "status")
+                    except:
+                        # TODO: review
+                        pass
+
+            name = func.__name__
+            self._function_dict[name] = saga_wrapper
+
+            # Consider the following example:
+            #
+            # @saga.step
+            # def step1(input, state, set_state):
+            #    return step2(input)
+            #
+            # the function will convert the next step into a SagaReturn
+            #
+            def meta_definition(
+                input: TInput, state: Union[TState, None] = None, delay: float = None
+            ):
+                return SagaReturn(name, input, state, delay)
+
+            # set __name__ back to original function name
+            meta_definition.__name__ = name
+            return meta_definition
+
+        return saga_step_decorator
+
+    def __init__(
+        self,
+        name: str,
+        **kw_args,
+    ):
+        self.name = name
+        self.owner = uuid.uuid4().hex
+
+        # SagaDAL can be injected in for internal testing. Outside this module, caller will pass in dsn
+        self._dal = kw_args.get("dal") or SagaDAL(Database(kw_args["dsn"]))
+
+        self._function_dict = {}
+        self._in_mem_sagas = AsyncIterator()
+
+        self.step = self._saga_step_decorator_generator()
+
+    async def start(self, instance_id: str, step, input, state, delay: float = None):
+        """Start a new saga
+
+        Note:
+        Worker pool is not created until `start_event_loop` is called.
+
+        If *delay* is set, the item will be enqueued into memory for immediate processing.
+
+        The item may get stuck for some time if the worker pool hasn't been created.
+
+        So for web server that doesn't need worker pool, make sure *delay* is set to be None.
+        """
+        saga = self._create_saga_dto(
+            self.name, self.owner, instance_id, step, input, state, delay=delay
+        )
+        saga = await self._dal.new_saga(saga)
+
+        # if status of saga is in_progress (immediate start), send to task queue for consumption
+        if saga.status == 1:
+            self._in_mem_sagas.send(saga)
+
+    async def get_state(self, instance_id: str):
+        """Return the internal state of a saga"""
+
+        return await self._dal.get_state(self.name, instance_id)
+
+    async def call(self, instance_id: str, step, input, delay: float = None):
+        """Overwrite a saga with new step, input and delay"""
+
+        ret = await self._dal.get_instance(self.name, instance_id)
+        saga = self._create_saga_dto(
+            self.name,
+            self.owner,
+            instance_id,
+            step,
+            input,
+            ret["state"],
+            ret["id"],
+            delay,
+        )
+        await self._dal.update_pending(saga, "step, input, owner, delay, status")
+
+        # if status of saga is in_progress (immediate start), send to task queue for consumption
+        if saga.status == 1:
+            self._in_mem_sagas.send(saga)
+
+    async def start_event_loop(
+        self,
+        batch_size: int,
+        low_watermark: int,
+        backoff: float,
+        available_workers: int,
+        health_check_timeout: int,
+    ):
+        """Start the event loop to do the following
+
+        1. heart beat to register and keep the instance alive
+        2. poll DB for pending sagas. It will *backoff* in seconds if in mem queue size > *low_watermark*, or get less items from db, per *batch_size*
+        3. create worker pool to execute saga functions (pool size defined by *available_workers*)
+        """
+        cancelled = False
+        cancel = lambda: cancelled
+
+        async def get_pending_saga():
+            try:
+                return await self._dal.get_pending_saga(
+                    self.name, self.owner, batch_size
+                )
+            except Exception as e:
+                return []
+
+        async def execute_saga(saga: SagaDTO):
+            if not saga.step in self._function_dict:
+                saga = saga._replace(
+                    state=SagaErrorState("Unrecognized saga step", None),
+                    status=3,
+                )
+                await self._dal.update_processing(saga, "state, status")
+            else:
+                await self._function_dict[saga.step](saga)
+
+        # send regular heart beat to DB
+        async def health_check(cancel):
+            while not cancel():
+                try:
+                    await self._dal.keep_alive(self.owner, health_check_timeout)
+                except:
+                    pass
+                await sleep(1)
+
+        # merge two queues (async generator) - tasks from polling and in-memory ones into a single stream
+        task_queue = merge(
+            poll(get_pending_saga, low_watermark, backoff, cancel),
+            self._in_mem_sagas,
+        )
+
         try:
-          print('entering', name, saga)
-          ret = await func(SagaContext(self, saga), saga.input, saga.state)
-          print('returning', ret)
-          if isinstance(ret, SagaNext):
-            saga = self._create_saga_dto(saga.name, saga.owner, saga.instance_id, ret.step, ret.input, ret.state, saga.id, ret.delay)
-            fields = 'step, input, owner, delay, status'
-          elif isinstance(ret, SagaEnd):
-            saga = saga._replace(state = ret.state, status = 2)
-            fields = 'status'
-          elif isinstance(ret, SagaThrow):
-            saga = saga._replace(state = ret.exception, status = 3)
-            fields = 'status'
-          
-          if ret.state != None: fields += ', state'
-          print('updating', saga, fields)
-          await self._dal.update_processing(saga, fields)
-            
-          if saga.status == 1:
-            self._async_iter.send(saga)
-        except SagaDAL.ConcurrencyException:
-          print('Concurrency exception')
-        except Exception as e:
-          try:
-            print('Error:', sys._getframe(1).f_code.co_name, sys._getframe(1).f_lineno, e)
-            saga = saga._replace(status = 0)
-            await self._dal.update_processing(saga, 'status')
-          except:
-            pass
+            await gather(
+                health_check(cancel),
+                start_loop(execute_saga, task_queue, available_workers, cancel),
+            )
+        except CancelledError:
+            # asyncio.get_event_loop.stop() will cancel all tasks in event loop, which generates CancelledError
+            # seeing this error means event_loop has stopped, so set the flag to break all loops
+            cancelled = True
+            # TODO: more clean up, e.g. terminate task queue, return items back to DB
 
-      name = func.__name__
-      self._function_map[name] = new_func
-      return func
+    @staticmethod
+    def _create_saga_dto(
+        name, owner, instance_id: str, step, input, state, id=0, delay: float = None
+    ):
+        """Construct SagaDTO for consumption by SagaDAL"""
 
-    self.step = factory
+        # if delay is not set, set status to be in_progress for immediate consumption
+        if delay == None:
+            status = 1
+            delay = 0
+        else:
+            status = 0
 
-    async def get_pending_saga():
-      try:
-        return await dal.get_pending_saga(self.name, self.owner, batch_size)
-      except:
-        return []
+        # convert function into its name
+        if callable(step):
+            step = step.__name__
 
-    self.event_gen = merge(
-      poll(get_pending_saga, low_watermark, backoff, self._cancel),
-      self._async_iter
-    )
+        return SagaDTO(id, name, instance_id, step, input, state, owner, delay, status)
 
-    self._cancel.on_cancel(self._async_iter.close, self._dal._db.close)
 
-  async def start(self, instance_id: str, step, input, state, delay:float = None):
-    saga = self._create_saga_dto(self.name, self.owner, instance_id, step, input, state, delay = delay)
-    saga = await self._dal.new_saga(saga)
-    if saga.status == 1:
-      self._async_iter.send(saga)
+dal = SagaDAL(Database("postgresql://postgres:1234@localhost:5432/postgres"))
+saga = Saga("deposit", dal=dal)
 
-  async def get_state(self, instance_id: str):
-    return await self._dal.get_state(self.name, instance_id)
-
-  async def call(self, instance_id: str, step, input, delay:float = None):
-    ret = await self._dal.get_instance(self.name, instance_id)
-    saga = self._create_saga_dto(self.name, self.owner, instance_id, step, input, ret['state'], ret['id'], delay)
-    await self._dal.update_pending(saga, 'step, input, owner, delay, status')
-    if saga.status == 1:
-      self._async_iter.send(saga)
-
-  @staticmethod
-  def _create_saga_dto(name, owner, instance_id: str, step, input, state, id = 0, delay:float = None):
-    if callable(step):
-      step = step.__name__
-    pass
-
-    if delay == None:
-      status = 1
-      delay = 0
-    else:
-      status = 0
-
-    return SagaDTO(id, name, instance_id, step, input, state, owner, delay, status)
-
-  async def start_event_loop(self):
-    async def process(saga: SagaDTO):
-      await self._function_map[saga.step](saga)
-
-    async def health_check():
-      while not self._cancel.requested:
-        try:
-          await self._dal.keep_alive(self.owner, self.health_check_timeout)
-        except:
-          pass
-        await sleep(1)
-        
-    await gather(health_check(), start_loop(process, self.event_gen, self.worker, self._cancel))
-    
-class SagaContext:
-  def __init__(self, saga: Saga, instance: SagaDTO):
-    self._dal = saga._dal
-    self._saga = saga
-    self._instance = instance
-
-  async def set_state(self, state):
-    self._saga = self._saga._replace(state = state)
-    await self._dal.update_processing(self._instance, 'state')
-
-dal = SagaDAL(Database('postgresql://postgres:1234@192.168.64.3:32768/postgres'))
-saga = Saga('deposit', 100, 30, 0.5, 5, 10, dal)
 
 @saga.step
-async def step1(ctx: SagaContext, input, state):
-  print(input, state)
-  await sleep(3)
-  print('call step2')
-  return SagaNext(step2, "new input", "new step")
+async def step1(input, state, set_state):
+    print(input, state)
+    await sleep(3)
+    print("call step2")
+    return step2("new input", "new step", delay=3)
+
 
 @saga.step
-async def step2(ctx: SagaContext, input, state):
-  print('step2', input, state)
-  return SagaEnd("end")
+async def step2(input, state, set_state):
+    print("step2", input, state)
+    await set_state("updated state")
+    return step3("end")
+
+
+@saga.step
+async def step3(input, state, set_state):
+    print("step2", input, state)
+    return
+
 
 class Test:
-  async def main(self):
-    #print(await dal.get_state(2))
-    #print(await dal.new_saga(d))
-    #print(await dal.get_pending_saga('deposit', saga.owner, 5))
-    #await saga.start(uuid.uuid4().hex, step1, "my test", "initial state")
-    await saga.start_event_loop()
+    async def main(self):
+        # print(await dal.get_state(2))
+        # print(await dal.new_saga(d))
+        # print(await dal.get_pending_saga('deposit', saga.owner, 5))
+        await saga.start(uuid.uuid4().hex, step1, "my test", "initial state", 0)
+        await saga.start_event_loop(100, 30, 0.5, 5, 10)
 
-if __name__ == '__main__':
-  get_event_loop().run_until_complete(Test().main())
-  get_event_loop().run_until_complete(gather(*all_tasks()))
 
-#orc.setup(step1, step2)
+if __name__ == "__main__":
+    get_event_loop().run_until_complete(Test().main())
+    # get_event_loop().run_until_complete(gather(*all_tasks()))
 
-#while orc.get_available_instance()
+# orc.setup(step1, step2)
+
+# while orc.get_available_instance()
