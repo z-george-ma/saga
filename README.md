@@ -7,9 +7,11 @@ A minimalist's saga workflow implementation with python and postgres.
 ## Design principles
 
 1. Straight-forward abstration with clear separation of concerns
+
 Saga interface is carefully designed for developers to easily understand what each operation does under the hood. This is particularly important for critical workloads when non-functional requirements can not be ignored, so developers know the trade-offs.
 
 2. Minimalism
+
 Saga is a library that focus on solving particular problem (self healing with basic workflow support), rather than a framework that prescribes how users structure their application. 
 
 This however means user has to put certain concerns (e.g. exception handling, retry policies) into application logic.
@@ -40,14 +42,13 @@ await saga.start("my example", debit, TransferInput(amount = 10), None)
 asyncio.get_event_loop().run_until_complete(saga.start_event_loop())
 ```
 
-### How do I define orchestration?
-How can I define orchestration and compensation actions, like https://github.com/absent1706/saga-framework#basics-synchronous-sagas?
+### How do I define orchestration and compensation actions, similar to [saga-framework](https://github.com/absent1706/saga-framework#basics-synchronous-sagas)?
 
-In short answer, you don't. Orchestration usually implies sequential control flow, i.e. run step 1, then step 2, etc. If subsequent step fails, roll back previous step (i.e. run compensation action for step 1).
+In short answer, you don't. Orchestration usually implies sequential control flow. If subsequent step fails, roll back previous steps.
 
-This could be handy for some circumstances, with the trade-off that it introduces assumptions how an application should work, and adds additional complexity.
+This could be handy for some circumstances, with the caveat that it assumes that's how you write your application.
 
-Saga leaves the decision of workflow and compensation actions to the user. In saga, you can return another step within saga functions, which gives you full control of the workflow, e.g. 
+Saga leaves the decision of workflow and compensation actions to the user. In saga, the continuation of workflow is done via returning another step within saga functions, which gives you full control of the workflow, e.g. 
 
 ```python
 @saga.step
@@ -81,12 +82,9 @@ def retry_example(input, state, set_state)
 ```
 
 ### How do I send external event to saga?
-Think of an example of payment gateway integration for e-commerce website. It can be broken down into the following steps
+A typical use case of external event is payment gateway integration, which uses webhook to notify caller of transaction status.
 
-1. our system calls payment gateway to deduct the fund
-2. payment gateway later calls our webhook for confirmation, then continue the flow
-
-It can be done as - 
+In saga it can be done as - 
 
 ```python
 @saga.step
@@ -104,7 +102,7 @@ saga.call(saga_instance, 'webhook', CONFIRMED)
 ```
 
 Notes: 
-1. It is a deliberate design decision that `saga.call` does not pass in a `state` - state is internal to the saga instance.
+1. It is a deliberate design decision that `saga.call` does not take `state` - state is internal to the saga instance.
 2. `saga.call` can only overwrite pending sagas. If the saga is running it will throw a `ConcurrencyException`
 
 ### How do I deal with poisoned messages?
@@ -112,11 +110,10 @@ Stay tuned.
 
 ## Technology choices
 #### Why postgres?
-Because I work for a company using python and postgres as the main tech stack.
+I work for a company using python and postgres as the main tech stack.
 
 #### Why asyncpg?
 https://magic.io/blog/asyncpg-1m-rows-from-postgres-to-python/
-
 
 ## Get started
 
