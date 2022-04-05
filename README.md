@@ -6,15 +6,23 @@ A minimalist's saga workflow implementation with python and postgres.
 
 ## Design principles
 
-1. Straight-forward abstration with clear separation of concerns
-
-Saga interface is carefully designed for developers to easily understand what each operation does under the hood. This is particularly important for critical workloads when non-functional requirements can not be ignored, so developers know the trade-offs.
-
-2. Minimalism
+Saga follows the [Unix philosophy](https://en.wikipedia.org/wiki/Unix_philosophy) - do one thing and one thing well. 
 
 Saga is a library that focus on solving particular problem (self healing with basic workflow support), rather than a framework that prescribes how users structure their application. 
 
-This however means user has to put certain concerns (e.g. exception handling, retry policies) into application logic.
+By giving user full control, there are trade-offs. 
+
+1. Learning curve
+
+Think of driving a manual car. To be an effective driver, you have to know how transmission works in a high level, e.g low gear gives you higher torque but goes slower. 
+
+The same applies to Saga. In any serious applications that non-functional requirements have to be taken into consideration, it is important to know what the library does exactly, as it may have performance implication. Saga interface is carefully designed to give developers full visibility of what happens under the hood.
+
+2. Bootstrapping from user
+
+User has to hook up logging framework, handle exceptions, think of retryability, circuit breaker pattern etc. 
+
+it is not a turn-key solution. You are encouraged to build abstractions on top of this project to encapsulate common concerns in your environment.
 
 Minimalism applies to package dependencies too. This project has only one dependency - asyncpg.
 
@@ -30,13 +38,13 @@ class TransferInput:
     amount: float
 
 @saga.step
-async def debit(input, state, set_state):
-    await account_one.debit(input.amount)
+async def debit(input, state, set_state, logger):
+    await first_account.debit(input.amount)
     return credit(input)
 
 @saga.step
-async def credit(input, state, set_state):
-    await account_two.credit(input.amount)
+async def credit(input, state, set_state, logger):
+    await second_account.credit(input.amount)
 
 await saga.start("my example", debit, TransferInput(amount = 10), None)
 # start event loop
@@ -133,4 +141,7 @@ pip3 install -r requirements.txt
 docker-compose up -d
 ```
 
-4. Start developing
+4. Unit testing
+```
+pytest --doctest-modules
+```

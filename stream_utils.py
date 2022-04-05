@@ -1,18 +1,45 @@
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED
+from curses import nonl
 from random import randrange
 from threading import Lock
-from asyncio import Future, Task, create_task, gather, get_event_loop, sleep, wait
+from asyncio import (
+    Future,
+    Task,
+    Event,
+    gather,
+    get_event_loop,
+    sleep,
+    wait,
+)
 from time import time
-from typing import AsyncGenerator, Callable, Coroutine, Generator, List, TypeVar
+from typing import (
+    AsyncGenerator,
+    Callable,
+    Coroutine,
+    Generator,
+    Generic,
+    List,
+    TypeVar,
+)
 
 T = TypeVar("T")
 
 
-class AsyncIterator:
+class AsyncIterator(AsyncGenerator[T, None], Generic[T]):
     """AsyncIterator implements async generator interface for streaming data.
 
     It also includes a *send* method for caller to push data into the stream.
+
+    Examples:
+
+    >>> ai = AsyncIterator()
+    >>> ai.send(123)
+    >>> run_async(ai.anext())
+    123
+    >>> ai.end()
+    >>> with raises(StopAsyncIteration): run_async(ai.anext())
+
     """
 
     def __init__(self):
@@ -32,12 +59,12 @@ class AsyncIterator:
 
         self.__source = source(self.__ll)
 
-    def send(self, item):
+    def send(self, item: T):
         with self.__lock:
             self.__ll.append(Future())
             self.__ll[-2].set_result(item)
 
-    def close(self):
+    def end(self):
         with self.__lock:
             self.__ll[-1].set_exception(StopAsyncIteration())
 
@@ -48,32 +75,51 @@ class AsyncIterator:
         with self.__lock:
             return self.__source.__anext__()
 
+    def asend(self, value):
+        raise NotImplementedError()
+
+    def athrow(self, **args):
+        raise NotImplementedError()
+
     def anext(self):
         return self.__anext__()
 
 
-def to_sync(gen: AsyncGenerator[T, None], cancel: Callable[[], bool]):
-    """Convert an async generator to a list of futures"""
+def to_sync(gen: AsyncGenerator[T, None], cancel: Event, loop=None):
+    """Convert an async generator to a list of futures
+
+    Examples:
+
+    >>> async def gen():
+    ...   for i in range(1, 4):
+    ...     yield i
+    >>> sync = to_sync(gen(), asyncio.Event())
+    >>> ret = (run_async(i) for i in sync)
+    >>> [next(ret), next(ret), next(ret)]
+    [1, 2, 3]
+    >>> with raises(StopAsyncIteration): next(ret)
+    """
 
     async def _cont(gen, last_value):
         if last_value != None:
             await last_value
         return await gen.__anext__()
 
+    loop = loop or get_event_loop()
     lock = Lock()
     ret = None
-    while not cancel():
+    while not cancel.is_set():
         with lock:
-            ret = create_task(_cont(gen, ret))
+            ret = loop.create_task(_cont(gen, ret))
             yield ret
 
 
 async def _loop_one(
     func: Callable[[T], Coroutine[None, None, None]],
     gen: Generator[Task[T], None, None],
-    cancel: Callable[[], bool],
+    cancel: Event,
 ):
-    while not cancel():
+    while not cancel.is_set():
         item = await next(gen)
         try:
             await func(item)
@@ -85,9 +131,30 @@ def start_loop(
     func: Callable[[T], Coroutine[None, None, None]],
     gen: AsyncGenerator[T, None],
     size: int,
-    cancel: Callable[[], bool],
+    cancel: Event,
 ):
-    """Start a worker pool to listen to *gen* stream and pass to *func* to process. Pool size is determined by *size*"""
+    """Start a worker pool to execute function on items from stream
+
+    *func*: function to process items. Exception will be swallowed.
+    *gen*: async stream to read data from
+    *size*: pool size
+    *cancel*: cancellation event
+
+    Examples:
+    >>> async def gen():
+    ...   for i in range(1, 1001):
+    ...     yield i
+    >>> evt = asyncio.Event()
+    >>> def worker_generator():
+    ...   sum_all = 0
+    ...   def worker(i):
+    ...     nonlocal sum_all
+    ...     sum_all += i
+    ...     if sum_all == 500500:
+    ...       evt.set()
+    >>> len(run_async(start_loop(worker_generator(), gen(), 10, evt)))
+    10
+    """
     it = to_sync(gen, cancel)
     arr = [_loop_one(func, it, cancel) for i in range(0, size)]
     return gather(*arr, return_exceptions=True)
@@ -96,35 +163,64 @@ def start_loop(
 async def poll(
     func: Callable[[], Coroutine[None, None, List[T]]],
     low_watermark: int,
+    expected_len: int,
     backoff: float,
-    cancel: Callable[[], bool],
+    cancel: Event,
 ):
     """
-    Poll func to get list of items and return as async iterator.
+    Call func periodically to get list of items and return as async stream.
 
-    Polling rules
-    1. don't poll if all consumers are busy
-    2. if returned items < low_watermark, it will wait for backoff before next poll
-    3. if returned items >= low_watermark, it means items are backing up upstream, so don't wait.
+    *func*: async function that returns a list of items
+    *low_watermark*: don't poll if remaining items in the queue >= low_watermark
+    *expected_len*: back off if *func* returns less item than *expected_len*
+    *backoff*: back off time in seconds
+    *cancel*: cancellation event
 
+    Examples:
+    >>> l = iter([30, 9, 1])
+    >>> import time
+    >>> async def func():
+    ...   now = time.time()
+    ...   return [now for i in range(0, next(l))]
+    >>> evt = asyncio.Event()
+    >>> stream = poll(func, 10, 20, 0.2, evt)
+    >>> batch1 = [run_async(stream.__anext__()) for i in range(0, 20)][0]
+    >>> batch2 = [run_async(stream.__anext__()) for i in range(0, 10)][-1]
+    >>> batch1 == batch2
+    True
+    >>> batch3 = [run_async(stream.__anext__()) for i in range(0, 10)]
+    >>> batch3[0] == batch3[8]
+    True
+    >>> batch3[9] - batch3[0] > 0.2
+    True
+    >>> batch3[0] - batch2 < 0.2
+    True
+    >>> async def cancel_event():
+    ...   await asyncio.sleep(0.2)
+    ...   evt.set()
+    >>> _ = asyncio.get_event_loop().create_task(cancel_event())
+    >>> with raises(StopAsyncIteration): run_async(stream.__anext__())
     """
 
     async def delayed_func(state):
         last_run, last_count = state
 
-        delay = backoff + last_run - time() if last_count < low_watermark else -1
+        delay = backoff + last_run - time() if last_count < expected_len else -1
         if delay > 0:
             await sleep(delay)
 
         state[0] = time()
-        ret = await func()
+        try:
+            ret = await func()
+        except:
+            ret = []
         state[1] = len(ret)
         return ret
 
-    task, state = None, [0, low_watermark]
     values: List[T] = []
+    task, state = None, [0, expected_len]
 
-    while not cancel():
+    while not cancel.is_set():
         l = len(values)
         if l < low_watermark and task == None:
             task = delayed_func(state)
@@ -141,9 +237,26 @@ async def _coroutine_tuple(task, *args):
     return (await task, *args)
 
 
-async def merge(*generators, when_exception="IGNORE"):
-    """Merge multiple streams into a single stream"""
-    nexts = [create_task(_coroutine_tuple(gen.__anext__(), gen)) for gen in generators]
+async def merge(*generators, when_exception="IGNORE", loop=None):
+    """Merge multiple streams into a single stream
+
+    Examples:
+    >>> async def gen1():
+    ...  for i in range(0, 10):
+    ...    await asyncio.sleep(0.01)
+    ...    yield i
+    >>> async def gen2():
+    ...  for i in range(0, 10):
+    ...    await asyncio.sleep(0.02)
+    ...    yield i
+    >>> new_stream = merge(gen1(), gen2())
+    >>> sum([run_async(new_stream.__anext__()) for i in range(0, 20)])
+    90
+    """
+    loop = loop or get_event_loop()
+    nexts = [
+        loop.create_task(_coroutine_tuple(gen.__anext__(), gen)) for gen in generators
+    ]
     while len(nexts):
         done, pending = await wait(nexts, return_when=FIRST_COMPLETED)
         for d in done:
@@ -153,46 +266,6 @@ async def merge(*generators, when_exception="IGNORE"):
             ):
                 continue
             value, gen = d.result()
-            pending.add(create_task(_coroutine_tuple(gen.__anext__(), gen)))
+            pending.add(loop.create_task(_coroutine_tuple(gen.__anext__(), gen)))
             yield value
         nexts = pending
-
-
-class Test:
-    @staticmethod
-    async def generate(x):
-        for i in range(0, x):
-            if i % 5 == 0:
-                await sleep(0.1)
-            yield i
-
-    @staticmethod
-    async def process(i):
-        print(f"processing {i}")
-        await sleep(0.01 + (i % 5) * 0.1)
-        if i == 3:
-            raise Exception()
-
-    async def main(self):
-        # await start_loop(Test.process, Test.generate(100), 5)
-        # async for i in poll(Test.get_data, 5, backoff=1):
-        #  print(f'processed {i}')
-        async for i in merge(
-            Test.generate(10),
-            Test.generate(100),
-            Test.generate(1000),
-            Test.generate(10000),
-            Test.generate(100000),
-        ):
-            print(i)
-
-    @staticmethod
-    async def get_data():
-        await sleep(0.1)
-        i = randrange(0, 10)
-        print(f"returning {i} items")
-        return range(0, i)
-
-
-if __name__ == "__main__":
-    get_event_loop().run_until_complete(Test().main())
