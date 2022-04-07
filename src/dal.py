@@ -286,6 +286,7 @@ CREATE INDEX IF NOT EXISTS IX_instance_runner_id_status ON saga.instance(runner_
 CREATE INDEX IF NOT EXISTS IX_saga_runner_runner_id ON saga.runner(runner_id);
 CREATE INDEX IF NOT EXISTS IX_saga_runner_last_seen ON saga.runner(last_seen);
 
+DROP PROCEDURE IF EXISTS saga.clean_up_dead_runner;
 CREATE OR REPLACE PROCEDURE saga.heart_beat(current_runner VARCHAR(100), timeout int)
 AS $$
   DECLARE 
