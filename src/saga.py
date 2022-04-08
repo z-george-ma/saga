@@ -7,13 +7,12 @@ from asyncio import (
 from dataclasses import dataclass
 from time import time
 from traceback import format_exc
-from typing import Any, Callable, Coroutine, TypeVar, Union
+from typing import Any, Callable, Coroutine, Optional, TypeVar, Union
 import uuid
-from dal import SagaDAL, SagaDTO
-from logger import Logger
-from stream_utils import AsyncIterator, merge, start_loop, poll
-
-from database import Database
+from .dal import SagaDAL, SagaDTO
+from .logger import Logger
+from .stream_utils import AsyncIterator, merge, start_loop, poll
+from .database import Database
 
 
 TInput = TypeVar("TInput")
@@ -141,6 +140,7 @@ class Saga:
         self._function_dict = {}
         self._in_mem_sagas = AsyncIterator()
         self._update_saga_queue = AsyncIterator()
+        self._event_loop_started = False
 
         self._logger = Logger(name, self.runner)
         self.logstream = self._logger.logstream
@@ -193,7 +193,13 @@ class Saga:
         )
         return await self._dal.get_state(self.name, instance)
 
-    async def call(self, instance: str, step, input, delay: float = None):
+    async def call(
+        self,
+        instance: str,
+        step: Union[Callable, str],
+        input: TInput,
+        delay: Optional[float] = None,
+    ):
         """Overwrite a saga with new step, input and delay"""
 
         ret = await self._dal.get_instance(self.name, instance)
@@ -225,15 +231,14 @@ class Saga:
             "Updating", delay=saga.delay, status=saga.status, source="call"
         )
 
-        try:
-            await self._dal.update_pending(saga)
-        except Exception as e:
-            logger.log_error(e, format_exc(), source="call")
-            raise e
+        await self._dal.update_pending(saga)
 
         # if status of saga is in_progress (immediate start), send to task queue for consumption
         if saga.status == 1:
             self._in_mem_sagas.send(saga)
+
+    def init_db(self):
+        return self._dal.init_db()
 
     async def start_event_loop(
         self,
@@ -261,6 +266,7 @@ class Saga:
         >>> run_async(loop)
         """
         cancel = Event()
+        self._event_loop_started = True
 
         async def get_pending_saga():
             try:
@@ -333,27 +339,26 @@ class Saga:
         )
 
         try:
+            execute_saga_loop = start_loop(execute_saga, task_queue, available_workers)
+            execute_saga_loop.add_done_callback(lambda _: self._update_saga_queue.end())
+
             await gather(
                 health_check(cancel),
-                start_loop(execute_saga, task_queue, available_workers, cancel),
+                execute_saga_loop,
                 start_loop(
-                    update_saga,
-                    self._update_saga_queue,
-                    available_update_threads,
-                    cancel,
+                    update_saga, self._update_saga_queue, available_update_threads
                 ),
             )
         except CancelledError:
             # asyncio.get_event_loop.stop() will cancel all tasks in event loop, which generates CancelledError
             # seeing this error means event_loop has stopped, so set the flag to break all loops
             cancel.set()
+            self._event_loop_started = False
             self._logger.log_info("Event loop cancelled", source="start_event_loop")
-            # TODO: more clean up, e.g. terminate task queue, return items back to DB
 
-    @staticmethod
-    def _get_step_delay_status(step, delay: float = None):
+    def _get_step_delay_status(self, step, delay: float = None):
         # if delay is not set, set status to be in_progress for immediate consumption
-        if delay == None:
+        if self._event_loop_started and delay == None:
             status = 1
         else:
             status = 0

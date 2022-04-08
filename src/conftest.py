@@ -1,11 +1,9 @@
 import asyncio
 from typing import Coroutine
 import uuid
-from pytest import fixture
-import pytest
-from dal import SagaDAL, SagaDTO
-
-from database import Database
+from pytest import fixture, raises
+from .dal import SagaDAL, SagaDTO
+from .database import Database
 
 
 @fixture(scope="session")
@@ -76,6 +74,6 @@ def run_async(co: Coroutine):
 @fixture(autouse=True)
 def add_np(doctest_namespace):
     doctest_namespace["asyncio"] = asyncio
-    doctest_namespace["raises"] = pytest.raises
+    doctest_namespace["raises"] = raises
     doctest_namespace["run_async"] = run_async
     doctest_namespace["uuid"] = uuid

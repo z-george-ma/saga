@@ -1,5 +1,6 @@
+from asyncio import create_task, get_event_loop
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, OrderedDict, overload
+from typing import Any, Dict, List, Mapping, OrderedDict, overload
 from asyncpg import create_pool
 
 
@@ -173,15 +174,20 @@ class Database:
         max_inactive_connection_lifetime=300.0,
         loop=None,
     ):
-        self._pool = create_pool(
-            dsn,
-            command_timeout=command_timeout,
-            min_size=min_size,
-            max_size=max_size,
-            max_queries=max_queries,
-            max_inactive_connection_lifetime=max_inactive_connection_lifetime,
-            loop=loop,
-        )
+        loop = loop or get_event_loop()
+
+        async def start_pool():
+            return await create_pool(
+                dsn,
+                command_timeout=command_timeout,
+                min_size=min_size,
+                max_size=max_size,
+                max_queries=max_queries,
+                max_inactive_connection_lifetime=max_inactive_connection_lifetime,
+                loop=loop,
+            )
+
+        self._pool = loop.create_task(start_pool())
 
     async def fetchval(self, sql, col=0, sql_timeout: float = None, **kw_args):
         """Return a value based on *sql* query.
@@ -195,9 +201,10 @@ class Database:
         >>> run_async(db.fetchval("SELECT id, column_1 FROM test", col=1))
         'abc'
         """
-        await self._pool
         sql, args = Database._format_sql(sql, **kw_args)
-        return await self._pool.fetchval(sql, *args, column=col, timeout=sql_timeout)
+        pool = await self._pool
+        async with pool.acquire() as conn:
+            return await conn.fetchval(sql, *args, column=col, timeout=sql_timeout)
 
     async def fetch(self, sql, sm: SqlMapping, sql_timeout: float = None, **kw_args):
         """Return multiple rows based on *sql* query.
@@ -212,10 +219,11 @@ class Database:
         >>> run_async(db.fetch("SELECT * FROM test where id <= 2 ORDER BY id", sm))
         [{'id': 1, 'column_1': 'abc'}, {'id': 2, 'column_1': 'def'}]
         """
-        await self._pool
         sql, args = Database._format_sql(sql, **kw_args)
-        records = await self._pool.fetch(sql, *args, timeout=sql_timeout)
-        return [sm.load(**record).value() for record in records]
+        pool = await self._pool
+        async with pool.acquire() as conn:
+            records = await conn.fetch(sql, *args, timeout=sql_timeout)
+            return [sm.load(**record).value() for record in records]
 
     async def fetchrow(self, sql, sm: SqlMapping, sql_timeout: float = None, **kw_args):
         """Return a row based on *sql* query.
@@ -231,13 +239,14 @@ class Database:
         {'id': 2, 'column_1': 'def'}
         """
 
-        await self._pool
         sql, args = Database._format_sql(sql, **kw_args)
-        record = await self._pool.fetchrow(sql, *args, timeout=sql_timeout)
-        if record != None:
-            return sm.load(**record).value()
-        else:
-            return None
+        pool = await self._pool
+        async with pool.acquire() as conn:
+            record = await conn.fetchrow(sql, *args, timeout=sql_timeout)
+            if record != None:
+                return sm.load(**record).value()
+            else:
+                return None
 
     async def execute(self, sql: str, sql_timeout: float = None, **kw_args):
         """Execute an SQL *command* for each sequence of arguments in *values* list.
@@ -250,9 +259,10 @@ class Database:
         >>> run_async(db.execute("INSERT INTO test (id, column_1) VALUES(:id, :col1)", id=3, col1='abcdef'))
         'INSERT 0 1'
         """
-        await self._pool
         sql, args = Database._format_sql(sql, **kw_args)
-        return await self._pool.execute(sql, *args, timeout=sql_timeout)
+        pool = await self._pool
+        async with pool.acquire() as conn:
+            return await conn.execute(sql, *args, timeout=sql_timeout)
 
     async def execute_many(
         self, sql: str, values: List[Dict[str, Any]], sql_timeout: float = None
@@ -267,11 +277,12 @@ class Database:
         >>> values = [dict(id=4, col1='abc'), dict(id=5, col1='def')]
         >>> run_async(db.execute_many("INSERT INTO test (id, column_1) VALUES(:id, :col1)", values))
         """
-        await self._pool
 
         new_sql, args = Database._format_sql(sql, **values[0])
         args = [Database._format_sql(sql, **v)[1] for v in values]
-        return await self._pool.executemany(new_sql, args, timeout=sql_timeout)
+        pool = await self._pool
+        async with pool.acquire() as conn:
+            return await conn.executemany(new_sql, args, timeout=sql_timeout)
 
     def close(self):
         return self._pool.close()

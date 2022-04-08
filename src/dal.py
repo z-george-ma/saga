@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 import pickle
 from typing import Any, Dict, Union
-from active_record import activerecord
+from .active_record import activerecord
 
-from database import (
+from .database import (
     Database,
     SqlMapping,
     from_data_class,
@@ -295,7 +295,7 @@ AS $$
   BEGIN
     UPDATE saga.runner SET last_seen = now WHERE runner_id = current_runner RETURNING id INTO r_id;
     IF r_id IS NULL THEN
-      INSERT INTO saga.runner (runner_id, last_seen) VALUES(r_id, now);
+      INSERT INTO saga.runner (runner_id, last_seen) VALUES(current_runner, now);
     END IF;
     CALL saga.clean_up_dead_runner(timeout);
   END

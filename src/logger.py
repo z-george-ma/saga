@@ -2,8 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import AsyncGenerator
-
-from stream_utils import AsyncIterator
+from .stream_utils import AsyncIterator
 
 
 class LogLevel(Enum):

@@ -1,12 +1,11 @@
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED
-from curses import nonl
-from random import randrange
 from threading import Lock
 from asyncio import (
     Future,
     Task,
     Event,
+    create_task,
     gather,
     get_event_loop,
     sleep,
@@ -85,7 +84,7 @@ class AsyncIterator(AsyncGenerator[T, None], Generic[T]):
         return self.__anext__()
 
 
-def to_sync(gen: AsyncGenerator[T, None], cancel: Event, loop=None):
+def to_sync(gen: AsyncGenerator[T, None], loop=None):
     """Convert an async generator to a list of futures
 
     Examples:
@@ -93,7 +92,7 @@ def to_sync(gen: AsyncGenerator[T, None], cancel: Event, loop=None):
     >>> async def gen():
     ...   for i in range(1, 4):
     ...     yield i
-    >>> sync = to_sync(gen(), asyncio.Event())
+    >>> sync = to_sync(gen())
     >>> ret = (run_async(i) for i in sync)
     >>> [next(ret), next(ret), next(ret)]
     [1, 2, 3]
@@ -108,7 +107,7 @@ def to_sync(gen: AsyncGenerator[T, None], cancel: Event, loop=None):
     loop = loop or get_event_loop()
     lock = Lock()
     ret = None
-    while not cancel.is_set():
+    while True:
         with lock:
             ret = loop.create_task(_cont(gen, ret))
             yield ret
@@ -117,9 +116,8 @@ def to_sync(gen: AsyncGenerator[T, None], cancel: Event, loop=None):
 async def _loop_one(
     func: Callable[[T], Coroutine[None, None, None]],
     gen: Generator[Task[T], None, None],
-    cancel: Event,
 ):
-    while not cancel.is_set():
+    while True:
         item = await next(gen)
         try:
             await func(item)
@@ -131,7 +129,6 @@ def start_loop(
     func: Callable[[T], Coroutine[None, None, None]],
     gen: AsyncGenerator[T, None],
     size: int,
-    cancel: Event,
 ):
     """Start a worker pool to execute function on items from stream
 
@@ -144,19 +141,19 @@ def start_loop(
     >>> async def gen():
     ...   for i in range(1, 1001):
     ...     yield i
-    >>> evt = asyncio.Event()
-    >>> def worker_generator():
+    >>> class Data:
     ...   sum_all = 0
+    >>> data = Data()
+    >>> def worker_generator(data):
     ...   def worker(i):
-    ...     nonlocal sum_all
-    ...     sum_all += i
-    ...     if sum_all == 500500:
-    ...       evt.set()
-    >>> len(run_async(start_loop(worker_generator(), gen(), 10, evt)))
-    10
+    ...     data.sum_all += i
+    ...   return worker
+    >>> _ = run_async(start_loop(worker_generator(data), gen(), 10))
+    >>> data.sum_all
+    500500
     """
-    it = to_sync(gen, cancel)
-    arr = [_loop_one(func, it, cancel) for i in range(0, size)]
+    it = to_sync(gen)
+    arr = [_loop_one(func, it) for i in range(0, size)]
     return gather(*arr, return_exceptions=True)
 
 
@@ -237,7 +234,7 @@ async def _coroutine_tuple(task, *args):
     return (await task, *args)
 
 
-async def merge(*generators, when_exception="IGNORE", loop=None):
+async def merge(*generators, when_exception="IGNORE"):
     """Merge multiple streams into a single stream
 
     Examples:
@@ -253,10 +250,7 @@ async def merge(*generators, when_exception="IGNORE", loop=None):
     >>> sum([run_async(new_stream.__anext__()) for i in range(0, 20)])
     90
     """
-    loop = loop or get_event_loop()
-    nexts = [
-        loop.create_task(_coroutine_tuple(gen.__anext__(), gen)) for gen in generators
-    ]
+    nexts = [create_task(_coroutine_tuple(gen.__anext__(), gen)) for gen in generators]
     while len(nexts):
         done, pending = await wait(nexts, return_when=FIRST_COMPLETED)
         for d in done:
@@ -266,6 +260,6 @@ async def merge(*generators, when_exception="IGNORE", loop=None):
             ):
                 continue
             value, gen = d.result()
-            pending.add(loop.create_task(_coroutine_tuple(gen.__anext__(), gen)))
+            pending.add(create_task(_coroutine_tuple(gen.__anext__(), gen)))
             yield value
         nexts = pending
