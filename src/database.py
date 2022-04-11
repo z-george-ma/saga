@@ -1,4 +1,4 @@
-from asyncio import Task, create_task, get_event_loop
+from asyncio import Task, get_event_loop
 from dataclasses import asdict
 from typing import Any, Dict, List, Mapping, OrderedDict, overload
 from asyncpg import Connection, Pool, create_pool
@@ -201,45 +201,26 @@ class _Connection:
         args = [self._format_sql(sql, **v)[1] for v in values]
         return await self._conn.executemany(new_sql, args, timeout=command_timeout)
 
+    def transaction(self, *, isolation=None, readonly=False, deferrable=False):
+        return self._conn.transaction(
+            isolation=isolation, readonly=readonly, deferrable=deferrable
+        )
+
 
 class Session:
-    def __init__(self, pool: Task[Pool]) -> None:
+    def __init__(self, pool: Task[Pool], timeout=None) -> None:
         self._pool = pool
+        self._timeout = timeout
 
     async def __aenter__(self):
         pool = await self._pool
-        self._conn = _Connection(await pool.acquire())
+        self._conn = _Connection(await pool.acquire(timeout=self._timeout))
         return self._conn
 
     async def __aexit__(self, *exc):
         pool = await self._pool
-        conn = self._conn._conn
+        await pool.release(self._conn._conn)
         self._conn = None
-        await pool.release(conn)
-
-    async def fetchval(self, sql, col=0, command_timeout: float = None, **kw_args):
-        return await self._conn.fetchval(sql, col, command_timeout, **kw_args)
-
-    async def fetch(
-        self, sql, sm: SqlMapping, command_timeout: float = None, **kw_args
-    ):
-        return await self._conn.fetch(sql, sm, command_timeout, **kw_args)
-
-    async def fetchrow(
-        self, sql, sm: SqlMapping, command_timeout: float = None, **kw_args
-    ):
-        return await self._conn.fetchrow(sql, sm, command_timeout, **kw_args)
-
-    async def execute(self, sql: str, command_timeout: float = None, **kw_args):
-        return await self._conn.execute(sql, command_timeout, **kw_args)
-
-    async def execute_many(
-        self, sql: str, values: List[Dict[str, Any]], command_timeout: float = None
-    ):
-        return await self._conn.execute_many(sql, values, command_timeout)
-
-    def transaction(self, *, isolation=None, readonly=False, deferrable=False):
-        return self._conn._conn.transaction(isolation, readonly, deferrable)
 
 
 class Database:
@@ -348,6 +329,22 @@ class Database:
         """
         async with Session(self._pool) as session:
             return await session.execute_many(sql, values, command_timeout)
+
+    def session(self, timeout=None):
+        """Return a database session for transaction control
+
+        *timeout*: timeout for getting connection from pool
+
+        Examples:
+        >>> db = getfixture('db')
+        >>> async def try_transaction():
+        ...   async with db.session() as ss:
+        ...     async with ss.transaction() as tx:
+        ...       await ss.execute("UPDATE test SET column_1=:col", col='useless')
+        ...       raise Exception()
+        >>> with raises(Exception): run_async(try_transaction())
+        """
+        return Session(self._pool, timeout)
 
     async def close(self):
         pool = await self._pool
