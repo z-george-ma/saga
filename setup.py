@@ -6,7 +6,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="pg-saga",
-    version="0.1.3",
+    version="0.1.4",
     scripts=[],
     author="George Ma",
     author_email="z.george.ma@gmail.com",

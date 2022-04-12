@@ -114,6 +114,9 @@ Notes:
 1. It is a deliberate design decision that `saga.call` does not take `state` - state is internal to the saga instance.
 2. `saga.call` can only overwrite pending sagas. If the saga is running it will throw a `ConcurrencyException`
 
+### How do I handle logs?
+`saga.start_event_loop` has a parameter called `log_handler`. You can hook into your own log provider.
+
 ### How do I deal with poisoned messages?
 Stay tuned.
 

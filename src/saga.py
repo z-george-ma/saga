@@ -7,10 +7,10 @@ from asyncio import (
 from dataclasses import dataclass
 from time import time
 from traceback import format_exc
-from typing import Any, Callable, Coroutine, Optional, TypeVar, Union
+from typing import Any, AsyncGenerator, Callable, Coroutine, Optional, TypeVar, Union
 import uuid
 from .dal import SagaDAL, SagaDTO
-from .logger import Logger
+from .logger import LogEntry, Logger
 from .stream_utils import AsyncIterator, merge, start_loop, poll
 from .database import Database
 
@@ -23,13 +23,18 @@ TState = TypeVar("TState")
 class SagaReturn:
     step: str
     input: TInput
-    state: Union[TState, None] = None
+    state: Optional[TState] = None
     delay: float = None
 
 
 class SagaError(Exception):
     def __init__(self, *args: object) -> None:
         super().__init__(*args)
+
+
+async def default_log_handler(log: AsyncGenerator[LogEntry, None]):
+    async for l in log:
+        pass
 
 
 class Saga:
@@ -120,7 +125,7 @@ class Saga:
             # the function will convert the next step into a SagaReturn
             #
             def meta_definition(
-                input: TInput, state: Union[TState, None] = None, delay: float = None
+                input: TInput, state: Optional[TState] = None, delay: float = None
             ):
                 return SagaReturn(name, input, state, delay)
 
@@ -143,7 +148,6 @@ class Saga:
         self._event_loop_started = False
 
         self._logger = Logger(name, self.runner)
-        self.logstream = self._logger.logstream
 
         self.step = self._saga_step_decorator_generator()
 
@@ -248,6 +252,9 @@ class Saga:
         available_workers: int,
         available_update_threads: int,
         health_check_timeout: int,
+        log_handler: Callable[
+            [AsyncGenerator[LogEntry, None]], Coroutine[None, None, None]
+        ] = default_log_handler,
     ):
         """Start the event loop to do the following
 
@@ -332,6 +339,10 @@ class Saga:
                     pass
                 await sleep(1)
 
+        def end_loop(_):
+            self._logger.log_info("Event loop ended")
+            self._logger.logstream.end()
+
         # merge two queues (async generator) - tasks from polling and in-memory ones into a single stream
         task_queue = merge(
             poll(get_pending_saga, low_watermark, batch_size, backoff, cancel),
@@ -342,12 +353,17 @@ class Saga:
             execute_saga_loop = start_loop(execute_saga, task_queue, available_workers)
             execute_saga_loop.add_done_callback(lambda _: self._update_saga_queue.end())
 
+            update_saga_loop = start_loop(
+                update_saga, self._update_saga_queue, available_update_threads
+            )
+
+            update_saga_loop.add_done_callback(end_loop)
+
             await gather(
                 health_check(cancel),
                 execute_saga_loop,
-                start_loop(
-                    update_saga, self._update_saga_queue, available_update_threads
-                ),
+                update_saga_loop,
+                log_handler(self._logger.logstream),
             )
         except CancelledError:
             # asyncio.get_event_loop.stop() will cancel all tasks in event loop, which generates CancelledError

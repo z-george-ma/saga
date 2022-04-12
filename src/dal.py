@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import pickle
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional
 from .active_record import activerecord
 
 from .database import (
@@ -79,7 +79,7 @@ class SagaDAL:
         saga.clear()
         return saga
 
-    async def get_instance(self, name, instance) -> Union[Dict, None]:
+    async def get_instance(self, name, instance) -> Optional[Dict]:
         """Return id and state for a pending saga with given name and instance.
 
         Examples

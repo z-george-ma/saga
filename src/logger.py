@@ -30,7 +30,7 @@ class LogEntry:
 
 
 class Logger:
-    logstream: AsyncGenerator[LogEntry, None]
+    logstream: AsyncIterator[LogEntry]
 
     def __init__(self, name, runner, logstream=None):
         self.logstream = logstream or AsyncIterator[LogEntry]()
