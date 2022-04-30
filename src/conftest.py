@@ -14,7 +14,8 @@ def db():
             "DROP TABLE IF EXISTS test;\
 CREATE TABLE IF NOT EXISTS test (id SERIAL PRIMARY KEY, column_1 VARCHAR(100));\
 INSERT INTO test (id, column_1) VALUES(1, 'abc');\
-INSERT INTO test (id, column_1) VALUES(2, 'def');"
+INSERT INTO test (id, column_1) VALUES(2, 'def');\
+INSERT INTO test (id, column_1) VALUES(3, 'def');"
         )
         return db
 

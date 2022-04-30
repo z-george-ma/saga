@@ -1,6 +1,6 @@
 from asyncio import Task, get_event_loop
 from dataclasses import asdict
-from typing import Any, Dict, List, OrderedDict, overload
+from typing import Any, AsyncContextManager, Dict, List, OrderedDict, overload
 import typing
 from asyncpg import Connection, Pool, create_pool
 
@@ -226,7 +226,7 @@ class _Connection:
         )
 
 
-class Session:
+class Session(AsyncContextManager):
     def __init__(self, pool: Task[Pool], timeout=None) -> None:
         self._pool = pool
         self._timeout = timeout
@@ -236,13 +236,13 @@ class Session:
         self._conn = _Connection(await pool.acquire(timeout=self._timeout))
         return self._conn
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, extype, ex, tb):
         pool = await self._pool
         await pool.release(self._conn._conn)
         self._conn = None
 
 
-class Transaction:
+class Transaction(AsyncContextManager):
     def __init__(
         self, pool: Task[Pool], timeout, isolation, readonly, deferrable
     ) -> None:
@@ -255,17 +255,25 @@ class Transaction:
     async def __aenter__(self):
         pool = await self._pool
         conn = self._conn = _Connection(await pool.acquire(timeout=self._timeout))
-        self._tx = conn.transaction(
+        tx = self._tx = conn.transaction(
             isolation=self._isolation,
             readonly=self._readonly,
             deferrable=self._deferrable,
         )
-        return self._tx
+        await tx.start()
+        return conn
 
-    async def __aexit__(self, *exc):
-        pool = await self._pool
-        await self._tx.__aexit__()
+    async def __aexit__(self, extype, ex, tb):
+        try:
+            if extype == None:
+                await self._tx.commit()
+            else:
+                await self._tx.rollback()
+        except:
+            pass
+
         self._tx = None
+        pool = await self._pool
         await pool.release(self._conn._conn)
         self._conn = None
 
@@ -353,7 +361,7 @@ class Database:
 
         Examples:
         >>> db = getfixture('db')
-        >>> run_async(db.execute("INSERT INTO test (id, column_1) VALUES(:id, :col1)", id=3, col1='abcdef'))
+        >>> run_async(db.execute("INSERT INTO test (id, column_1) VALUES(:id, :col1)", id=103, col1='abcdef'))
         'INSERT 0 1'
         """
         async with Session(self._pool) as session:
@@ -413,9 +421,10 @@ class Database:
         >>> db = getfixture('db')
         >>> async def try_transaction():
         ...   async with db.transaction() as tx:
-        ...     await ss.execute("UPDATE test SET column_1=:col", col='useless')
-        ...     raise Exception()
-        >>> with raises(Exception): run_async(try_transaction())
+        ...     await tx.execute("UPDATE test SET column_1=:col WHERE id=:id", col='useless', id=3)
+        >>> run_async(try_transaction())
+        >>> run_async(db.fetchval("SELECT column_1 FROM test where id = 3"))
+        'useless'
         """
         return Transaction(self._pool, timeout, isolation, readonly, deferrable)
 
