@@ -1,10 +1,31 @@
 from asyncio import Task, get_event_loop
 from dataclasses import asdict
-from typing import Any, Dict, List, Mapping, OrderedDict, overload
+from typing import Any, Dict, List, OrderedDict, overload
+import typing
 from asyncpg import Connection, Pool, create_pool
 
 
-class SqlMapping(Mapping):
+class Mapping(typing.Mapping):
+    """Maps SQL record to data class
+
+    *cls_type*: the data class type to map record to
+    *kw_args*: named argument to define any transformation required before setting the value for data class
+
+    Examples:
+    >>> from dataclasses import dataclass
+    >>> @dataclass
+    ... class MyType:
+    ...   a: int
+    ...   b: int
+    ...   c: int
+    >>> # define simple mapping without transformation
+    >>> mapping = Mapping(MyType)
+    >>> # define mapping with transformation
+    >>> mapping = Mapping(MyType, c=lambda x: x + 1)
+    >>> # transform database column columnX to c
+    >>> mapping = Mapping(MyType, c=('columnX', lambda x: x))
+    """
+
     def __init__(self, cls_type, **kw_args):
         self._cls_type = cls_type
         self._transform = []
@@ -43,7 +64,7 @@ class SqlMapping(Mapping):
         return self
 
 
-def fields(m: Mapping) -> str:
+def fields(m: typing.Mapping) -> str:
     """Return keys in the mapping as a comma separated string
 
     Example:
@@ -53,7 +74,7 @@ def fields(m: Mapping) -> str:
     return ",".join([k for k in m])
 
 
-def placeholders(m: Mapping) -> str:
+def placeholders(m: typing.Mapping) -> str:
     """Return keys in the mapping as a comma separated placeholders
 
     Example:
@@ -63,7 +84,7 @@ def placeholders(m: Mapping) -> str:
     return ",".join([":" + k for k in m])
 
 
-def updates(m: Mapping, prefix: str = None) -> str:
+def updates(m: typing.Mapping, prefix: str = None) -> str:
     """Return keys in *m* in a format acceptable for UPDATE
 
     Example:
@@ -74,7 +95,7 @@ def updates(m: Mapping, prefix: str = None) -> str:
     return ",".join([f"{prefix}{k}=:{k}" for k in m])
 
 
-def from_data_class(value, includes: List[str] = None, **kw_args) -> Mapping:
+def from_data_class(value, includes: List[str] = None, **kw_args) -> typing.Mapping:
     """Return a Mapping from *value*, applying functions to the fields
 
     *includes*: if specified, trim down the returned mapping to only the attributes in *includes*
@@ -96,7 +117,7 @@ def from_data_class(value, includes: List[str] = None, **kw_args) -> Mapping:
     return apply(value, **kw_args)
 
 
-def apply(value: Mapping, **kw_args) -> Mapping:
+def apply(value: typing.Mapping, **kw_args) -> typing.Mapping:
     """Return a Mapping, applying functions to the fields
 
     Keyword argument can be a function or a tuple with the format of (old_field, mapping_function, remove_old_field)
@@ -127,11 +148,11 @@ def apply(value: Mapping, **kw_args) -> Mapping:
 
 
 @overload
-def include(m: Mapping, arg_list: List[str]) -> OrderedDict:
+def include(m: typing.Mapping, arg_list: List[str]) -> OrderedDict:
     ...
 
 
-def include(m: Mapping, *args) -> OrderedDict:
+def include(m: typing.Mapping, *args) -> OrderedDict:
     """Return a new mapping contains only keys specified in *args*.
 
     *args* can be strings, comma separated strings or list of strings.
@@ -173,15 +194,13 @@ class _Connection:
             sql, *args, column=col, timeout=command_timeout
         )
 
-    async def fetch(
-        self, sql, sm: SqlMapping, command_timeout: float = None, **kw_args
-    ):
+    async def fetch(self, sql, sm: Mapping, command_timeout: float = None, **kw_args):
         sql, args = self._format_sql(sql, **kw_args)
         records = await self._conn.fetch(sql, *args, timeout=command_timeout)
         return [sm.load(**record).value() for record in records]
 
     async def fetchrow(
-        self, sql, sm: SqlMapping, command_timeout: float = None, **kw_args
+        self, sql, sm: Mapping, command_timeout: float = None, **kw_args
     ):
         sql, args = self._format_sql(sql, **kw_args)
         record = await self._conn.fetchrow(sql, *args, timeout=command_timeout)
@@ -219,6 +238,34 @@ class Session:
 
     async def __aexit__(self, *exc):
         pool = await self._pool
+        await pool.release(self._conn._conn)
+        self._conn = None
+
+
+class Transaction:
+    def __init__(
+        self, pool: Task[Pool], timeout, isolation, readonly, deferrable
+    ) -> None:
+        self._pool = pool
+        self._timeout = timeout
+        self._isolation = isolation
+        self._readonly = readonly
+        self._deferrable = deferrable
+
+    async def __aenter__(self):
+        pool = await self._pool
+        conn = self._conn = _Connection(await pool.acquire(timeout=self._timeout))
+        self._tx = conn.transaction(
+            isolation=self._isolation,
+            readonly=self._readonly,
+            deferrable=self._deferrable,
+        )
+        return self._tx
+
+    async def __aexit__(self, *exc):
+        pool = await self._pool
+        await self._tx.__aexit__()
+        self._tx = None
         await pool.release(self._conn._conn)
         self._conn = None
 
@@ -264,9 +311,7 @@ class Database:
         async with Session(self._pool) as session:
             return await session.fetchval(sql, col, command_timeout, **kw_args)
 
-    async def fetch(
-        self, sql, sm: SqlMapping, command_timeout: float = None, **kw_args
-    ):
+    async def fetch(self, sql, sm: Mapping, command_timeout: float = None, **kw_args):
         """Return multiple rows based on *sql* query.
 
         *sql*: sql text, with colon prefixed parameters
@@ -275,7 +320,7 @@ class Database:
 
         Examples:
         >>> db = getfixture('db')
-        >>> sm = SqlMapping(dict)
+        >>> sm = Mapping(dict)
         >>> run_async(db.fetch("SELECT * FROM test where id <= 2 ORDER BY id", sm))
         [{'id': 1, 'column_1': 'abc'}, {'id': 2, 'column_1': 'def'}]
         """
@@ -283,7 +328,7 @@ class Database:
             return await session.fetch(sql, sm, command_timeout, **kw_args)
 
     async def fetchrow(
-        self, sql, sm: SqlMapping, command_timeout: float = None, **kw_args
+        self, sql, sm: Mapping, command_timeout: float = None, **kw_args
     ):
         """Return a row based on *sql* query.
 
@@ -293,7 +338,7 @@ class Database:
 
         Examples:
         >>> db = getfixture('db')
-        >>> sm = SqlMapping(dict)
+        >>> sm = Mapping(dict)
         >>> run_async(db.fetchrow("SELECT * FROM test WHERE id=:id", sm, id=2))
         {'id': 2, 'column_1': 'def'}
         """
@@ -331,7 +376,7 @@ class Database:
             return await session.execute_many(sql, values, command_timeout)
 
     def session(self, timeout=None):
-        """Return a database session for transaction control
+        """Return a database session. It is possible to create transaction from session.
 
         *timeout*: timeout for getting connection from pool
 
@@ -345,6 +390,34 @@ class Database:
         >>> with raises(Exception): run_async(try_transaction())
         """
         return Session(self._pool, timeout)
+
+    def transaction(
+        self, *, timeout=None, isolation=None, readonly=False, deferrable=False
+    ):
+        """Return a database transaction.
+
+        :param timeout: timeout for getting connection from pool
+
+        :param isolation: Transaction isolation mode, can be one of:
+                          `'serializable'`, `'repeatable_read'`,
+                          `'read_committed'`. If not specified, the behavior
+                          is up to the server and session, which is usually
+                          ``read_committed``.
+
+        :param readonly: Specifies whether or not this transaction is
+                         read-only.
+
+        :param deferrable: Specifies whether or not this transaction is
+                           deferrable.
+        Examples:
+        >>> db = getfixture('db')
+        >>> async def try_transaction():
+        ...   async with db.transaction() as tx:
+        ...     await ss.execute("UPDATE test SET column_1=:col", col='useless')
+        ...     raise Exception()
+        >>> with raises(Exception): run_async(try_transaction())
+        """
+        return Transaction(self._pool, timeout, isolation, readonly, deferrable)
 
     async def close(self):
         pool = await self._pool

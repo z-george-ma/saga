@@ -5,7 +5,7 @@ from .active_record import activerecord
 
 from .database import (
     Database,
-    SqlMapping,
+    Mapping,
     from_data_class,
     updates,
     fields,
@@ -89,7 +89,7 @@ class SagaDAL:
         """
         return await self._db.fetchrow(
             "SELECT id, state FROM saga.instance WHERE name = :name AND instance_id = :instance AND status = 0",
-            SqlMapping(dict, state=lambda s: pickle.loads(s)),
+            Mapping(dict, state=lambda s: pickle.loads(s)),
             name=name,
             instance=instance,
         )
@@ -226,7 +226,7 @@ FROM   cte
 WHERE  cte.id = i.id AND i.status = 0
 RETURNING i.*
 """,
-            SqlMapping(
+            Mapping(
                 SagaDTO,
                 input=lambda x: pickle.loads(x),
                 state=lambda x: pickle.loads(x),
